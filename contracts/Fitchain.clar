@@ -327,3 +327,413 @@
     u0
   )
 )
+
+(define-constant ERR_INVALID_LEAGUE (err u111))
+(define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u112))
+(define-constant ERR_ALREADY_CLAIMED (err u113))
+(define-constant ERR_REQUIREMENTS_NOT_MET (err u114))
+(define-constant ERR_LEAGUE_FULL (err u115))
+(define-constant ERR_SEASON_ENDED (err u116))
+(define-constant ERR_INVALID_BADGE (err u117))
+
+(define-data-var current-season uint u1)
+(define-data-var season-duration uint u4320)
+(define-data-var season-start-block uint u0)
+(define-data-var achievement-id-nonce uint u0)
+(define-data-var badge-id-nonce uint u0)
+(define-data-var league-entry-fee uint u100)
+
+(define-map leagues
+  { league-id: uint }
+  {
+    name: (string-ascii 50),
+    tier: uint,
+    max-participants: uint,
+    current-participants: uint,
+    season: uint,
+    entry-fee: uint,
+    reward-pool: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map league-participants
+  { league-id: uint, user: principal }
+  {
+    joined-at: uint,
+    season-score: uint,
+    rank: uint,
+    rewards-claimed: bool,
+    goals-completed: uint,
+    best-streak: uint
+  }
+)
+
+(define-map user-leagues
+  { user: principal, season: uint }
+  {
+    current-league: uint,
+    tier-progress: uint,
+    season-achievements: uint,
+    total-season-rewards: uint,
+    rank-history: (list 10 uint)
+  }
+)
+
+(define-map achievements
+  { achievement-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    category: (string-ascii 30),
+    requirement-type: (string-ascii 20),
+    requirement-value: uint,
+    reward-amount: uint,
+    badge-id: uint,
+    is-active: bool,
+    rarity: (string-ascii 20)
+  }
+)
+
+(define-map user-achievements
+  { user: principal, achievement-id: uint }
+  {
+    earned-at: uint,
+    season-earned: uint,
+    reward-claimed: bool,
+    progress: uint
+  }
+)
+
+(define-map badges
+  { badge-id: uint }
+  {
+    name: (string-ascii 50),
+    symbol: (string-ascii 10),
+    description: (string-ascii 200),
+    rarity: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map user-badges
+  { user: principal, badge-id: uint }
+  {
+    earned-at: uint,
+    season-earned: uint,
+    display-order: uint
+  }
+)
+
+(define-map season-leaderboard
+  { season: uint, rank: uint }
+  {
+    user: principal,
+    total-score: uint,
+    achievements-earned: uint,
+    goals-completed: uint,
+    final-league: uint
+  }
+)
+
+(define-public (create-league (name (string-ascii 50)) (tier uint) (max-participants uint) (entry-fee uint))
+  (let
+    (
+      (league-id (+ (var-get goal-id-nonce) u1))
+      (current-season-val (var-get current-season))
+    )
+    (asserts! (> tier u0) ERR_INVALID_LEAGUE)
+    (asserts! (> max-participants u0) ERR_INVALID_LEAGUE)
+    (asserts! (>= entry-fee u0) ERR_INVALID_AMOUNT)
+    
+    (map-set leagues
+      { league-id: league-id }
+      {
+        name: name,
+        tier: tier,
+        max-participants: max-participants,
+        current-participants: u0,
+        season: current-season-val,
+        entry-fee: entry-fee,
+        reward-pool: u0,
+        is-active: true,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set goal-id-nonce league-id)
+    (ok league-id)
+  )
+)
+
+(define-public (join-league (league-id uint))
+  (let
+    (
+      (league (unwrap! (map-get? leagues { league-id: league-id }) ERR_INVALID_LEAGUE))
+      (participant-key { league-id: league-id, user: tx-sender })
+      (current-season-val (var-get current-season))
+      (user-balance (ft-get-balance fitchain-token tx-sender))
+    )
+    (asserts! (get is-active league) ERR_INVALID_LEAGUE)
+    (asserts! (is-eq (get season league) current-season-val) ERR_SEASON_ENDED)
+    (asserts! (< (get current-participants league) (get max-participants league)) ERR_LEAGUE_FULL)
+    (asserts! (>= user-balance (get entry-fee league)) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (is-none (map-get? league-participants participant-key)) ERR_GOAL_ALREADY_EXISTS)
+    
+    (if (> (get entry-fee league) u0)
+      (unwrap! (ft-burn? fitchain-token (get entry-fee league) tx-sender) ERR_INSUFFICIENT_BALANCE)
+      true
+    )
+    
+    (map-set league-participants
+      participant-key
+      {
+        joined-at: stacks-block-height,
+        season-score: u0,
+        rank: u0,
+        rewards-claimed: false,
+        goals-completed: u0,
+        best-streak: u0
+      }
+    )
+    
+    (map-set leagues
+      { league-id: league-id }
+      (merge league { 
+        current-participants: (+ (get current-participants league) u1),
+        reward-pool: (+ (get reward-pool league) (get entry-fee league))
+      })
+    )
+    
+    (map-set user-leagues
+      { user: tx-sender, season: current-season-val }
+      {
+        current-league: league-id,
+        tier-progress: u0,
+        season-achievements: u0,
+        total-season-rewards: u0,
+        rank-history: (list u0)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-achievement (name (string-ascii 50)) (description (string-ascii 200)) (category (string-ascii 30)) (requirement-type (string-ascii 20)) (requirement-value uint) (reward-amount uint) (rarity (string-ascii 20)))
+  (let
+    (
+      (achievement-id (+ (var-get achievement-id-nonce) u1))
+      (badge-id (+ (var-get badge-id-nonce) u1))
+    )
+    (asserts! (> requirement-value u0) ERR_INVALID_AMOUNT)
+    (asserts! (> reward-amount u0) ERR_INVALID_AMOUNT)
+    
+    (map-set badges
+      { badge-id: badge-id }
+      {
+        name: name,
+        symbol: (unwrap-panic (as-max-len? (unwrap-panic (slice? name u0 u10)) u10)),
+        description: description,
+        rarity: rarity,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set achievements
+      { achievement-id: achievement-id }
+      {
+        name: name,
+        description: description,
+        category: category,
+        requirement-type: requirement-type,
+        requirement-value: requirement-value,
+        reward-amount: reward-amount,
+        badge-id: badge-id,
+        is-active: true,
+        rarity: rarity
+      }
+    )
+    
+    (var-set achievement-id-nonce achievement-id)
+    (var-set badge-id-nonce badge-id)
+    (ok achievement-id)
+  )
+)
+
+(define-public (claim-achievement (achievement-id uint))
+  (let
+    (
+      (achievement (unwrap! (map-get? achievements { achievement-id: achievement-id }) ERR_ACHIEVEMENT_NOT_FOUND))
+      (user-achievement-key { user: tx-sender, achievement-id: achievement-id })
+      (user-stats-data (unwrap! (map-get? user-stats { user: tx-sender }) ERR_GOAL_NOT_FOUND))
+      (current-season-val (var-get current-season))
+    )
+    (asserts! (get is-active achievement) ERR_ACHIEVEMENT_NOT_FOUND)
+    (asserts! (is-none (map-get? user-achievements user-achievement-key)) ERR_ALREADY_CLAIMED)
+    
+    (let
+      (
+        (requirement-met (check-achievement-requirement achievement user-stats-data))
+      )
+      (asserts! requirement-met ERR_REQUIREMENTS_NOT_MET)
+      
+      (map-set user-achievements
+        user-achievement-key
+        {
+          earned-at: stacks-block-height,
+          season-earned: current-season-val,
+          reward-claimed: true,
+          progress: (get requirement-value achievement)
+        }
+      )
+      
+      (map-set user-badges
+        { user: tx-sender, badge-id: (get badge-id achievement) }
+        {
+          earned-at: stacks-block-height,
+          season-earned: current-season-val,
+          display-order: u0
+        }
+      )
+      
+      (unwrap! (ft-mint? fitchain-token (get reward-amount achievement) tx-sender) ERR_INSUFFICIENT_BALANCE)
+      (ok true)
+    )
+  )
+)
+
+(define-public (update-league-score (user principal) (score-increment uint))
+  (let
+    (
+      (current-season-val (var-get current-season))
+      (user-league-data (map-get? user-leagues { user: user, season: current-season-val }))
+    )
+    (match user-league-data
+      user-league
+      (let
+        (
+          (league-id (get current-league user-league))
+          (participant-key { league-id: league-id, user: user })
+          (participant-data (unwrap! (map-get? league-participants participant-key) ERR_GOAL_NOT_FOUND))
+        )
+        (map-set league-participants
+          participant-key
+          (merge participant-data { 
+            season-score: (+ (get season-score participant-data) score-increment),
+            goals-completed: (+ (get goals-completed participant-data) u1)
+          })
+        )
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-public (distribute-season-rewards (season uint) (league-id uint))
+  (let
+    (
+      (league (unwrap! (map-get? leagues { league-id: league-id }) ERR_INVALID_LEAGUE))
+      (reward-pool (get reward-pool league))
+      (participant-count (get current-participants league))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> reward-pool u0) ERR_INVALID_AMOUNT)
+    (asserts! (> participant-count u0) ERR_INVALID_LEAGUE)
+    
+    (let
+      (
+        (first-place-reward (/ (* reward-pool u50) u100))
+        (second-place-reward (/ (* reward-pool u30) u100))
+        (third-place-reward (/ (* reward-pool u20) u100))
+      )
+      (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) reward-pool))
+      (ok true)
+    )
+  )
+)
+
+(define-public (start-new-season)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set current-season (+ (var-get current-season) u1))
+    (var-set season-start-block stacks-block-height)
+    (ok (var-get current-season))
+  )
+)
+
+(define-private (check-achievement-requirement (achievement {name: (string-ascii 50), description: (string-ascii 200), category: (string-ascii 30), requirement-type: (string-ascii 20), requirement-value: uint, reward-amount: uint, badge-id: uint, is-active: bool, rarity: (string-ascii 20)}) (user-stats-data {total-goals: uint, completed-goals: uint, total-rewards: uint, current-streak: uint, last-completion: uint}))
+  (let
+    (
+      (req-type (get requirement-type achievement))
+      (req-value (get requirement-value achievement))
+    )
+    (if (is-eq req-type "goals-completed")
+      (>= (get completed-goals user-stats-data) req-value)
+      (if (is-eq req-type "current-streak")
+        (>= (get current-streak user-stats-data) req-value)
+        (if (is-eq req-type "total-rewards")
+          (>= (get total-rewards user-stats-data) req-value)
+          false
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-league (league-id uint))
+  (map-get? leagues { league-id: league-id })
+)
+
+(define-read-only (get-league-participant (league-id uint) (user principal))
+  (map-get? league-participants { league-id: league-id, user: user })
+)
+
+(define-read-only (get-user-league (user principal) (season uint))
+  (map-get? user-leagues { user: user, season: season })
+)
+
+(define-read-only (get-achievement (achievement-id uint))
+  (map-get? achievements { achievement-id: achievement-id })
+)
+
+(define-read-only (get-user-achievement (user principal) (achievement-id uint))
+  (map-get? user-achievements { user: user, achievement-id: achievement-id })
+)
+
+(define-read-only (get-badge (badge-id uint))
+  (map-get? badges { badge-id: badge-id })
+)
+
+(define-read-only (get-user-badge (user principal) (badge-id uint))
+  (map-get? user-badges { user: user, badge-id: badge-id })
+)
+
+(define-read-only (get-season-leaderboard (season uint) (rank uint))
+  (map-get? season-leaderboard { season: season, rank: rank })
+)
+
+(define-read-only (get-current-season)
+  (var-get current-season)
+)
+
+(define-read-only (get-season-info)
+  {
+    current-season: (var-get current-season),
+    season-duration: (var-get season-duration),
+    season-start-block: (var-get season-start-block),
+    blocks-remaining: (if (> (+ (var-get season-start-block) (var-get season-duration)) stacks-block-height)
+                        (- (+ (var-get season-start-block) (var-get season-duration)) stacks-block-height)
+                        u0)
+  }
+)
+
+(define-read-only (get-achievement-stats)
+  {
+    total-achievements: (var-get achievement-id-nonce),
+    total-badges: (var-get badge-id-nonce),
+    league-entry-fee: (var-get league-entry-fee)
+  }
+)
