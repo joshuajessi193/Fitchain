@@ -737,3 +737,430 @@
     league-entry-fee: (var-get league-entry-fee)
   }
 )
+
+;; Fitness Buddy & Mentor System Constants
+(define-constant ERR_BUDDY_REQUEST_NOT_FOUND (err u118))
+(define-constant ERR_ALREADY_HAVE_BUDDY (err u119))
+(define-constant ERR_CANNOT_BUDDY_YOURSELF (err u120))
+(define-constant ERR_NOT_A_MENTOR (err u121))
+(define-constant ERR_MENTOR_CAPACITY_FULL (err u122))
+(define-constant ERR_ALREADY_REQUESTED (err u123))
+(define-constant ERR_INVALID_RATING (err u124))
+(define-constant ERR_NO_ACTIVE_PARTNERSHIP (err u125))
+
+;; Buddy & Mentor System Data Variables
+(define-data-var buddy-request-id-nonce uint u0)
+(define-data-var mentor-bonus-multiplier uint u150) ;; 1.5x bonus for mentors
+(define-data-var checkin-reward uint u10)
+(define-data-var partnership-success-bonus uint u100)
+
+;; Buddy Requests Map
+(define-map buddy-requests
+  { request-id: uint }
+  {
+    requester: principal,
+    target: principal,
+    message: (string-ascii 200),
+    status: (string-ascii 10), ;; "pending", "accepted", "declined"
+    created-at: uint,
+    responded-at: (optional uint)
+  }
+)
+
+;; Active Buddy Partnerships
+(define-map buddy-partnerships
+  { user-a: principal, user-b: principal }
+  {
+    started-at: uint,
+    total-checkins: uint,
+    last-checkin: uint,
+    shared-goals: uint,
+    partnership-score: uint,
+    is-active: bool
+  }
+)
+
+;; Mentor Registration
+(define-map mentors
+  { mentor: principal }
+  {
+    registered-at: uint,
+    specialties: (string-ascii 100), ;; e.g., "weight-loss,strength,endurance"
+    max-mentees: uint,
+    current-mentees: uint,
+    total-mentees-helped: uint,
+    average-rating: uint,
+    total-ratings: uint,
+    mentor-level: uint, ;; 1-5 based on experience
+    is-active: bool
+  }
+)
+
+;; Mentor-Mentee Relationships
+(define-map mentorships
+  { mentor: principal, mentee: principal }
+  {
+    started-at: uint,
+    goals-completed-together: uint,
+    last-interaction: uint,
+    mentee-progress-score: uint,
+    mentor-rating: (optional uint),
+    is-active: bool,
+    graduation-date: (optional uint) ;; When mentee "graduates"
+  }
+)
+
+;; Check-in System
+(define-map checkins
+  { user: principal, partner: principal, date: uint }
+  {
+    checkin-type: (string-ascii 20), ;; "buddy" or "mentor"
+    message: (string-ascii 300),
+    progress-update: uint,
+    encouragement-given: bool,
+    created-at: uint
+  }
+)
+
+;; User Partnership Status
+(define-map user-partnerships
+  { user: principal }
+  {
+    has-buddy: bool,
+    current-buddy: (optional principal),
+    is-mentor: bool,
+    has-mentor: bool,
+    current-mentor: (optional principal),
+    total-partnerships: uint,
+    successful-partnerships: uint
+  }
+)
+
+;; Public Functions for Buddy System
+
+;; Send a buddy request to another user
+(define-public (send-buddy-request (target principal) (message (string-ascii 200)))
+  (let
+    (
+      (request-id (+ (var-get buddy-request-id-nonce) u1))
+      (requester-status (default-to 
+        { has-buddy: false, current-buddy: none, is-mentor: false, has-mentor: false, current-mentor: none, total-partnerships: u0, successful-partnerships: u0 }
+        (map-get? user-partnerships { user: tx-sender })
+      ))
+      (target-status (default-to 
+        { has-buddy: false, current-buddy: none, is-mentor: false, has-mentor: false, current-mentor: none, total-partnerships: u0, successful-partnerships: u0 }
+        (map-get? user-partnerships { user: target })
+      ))
+    )
+    ;; Validation checks
+    (asserts! (not (is-eq tx-sender target)) ERR_CANNOT_BUDDY_YOURSELF)
+    (asserts! (not (get has-buddy requester-status)) ERR_ALREADY_HAVE_BUDDY)
+    (asserts! (not (get has-buddy target-status)) ERR_ALREADY_HAVE_BUDDY)
+    
+    ;; Create buddy request
+    (map-set buddy-requests
+      { request-id: request-id }
+      {
+        requester: tx-sender,
+        target: target,
+        message: message,
+        status: "pending",
+        created-at: stacks-block-height,
+        responded-at: none
+      }
+    )
+    
+    (var-set buddy-request-id-nonce request-id)
+    (ok request-id)
+  )
+)
+
+;; Accept a buddy request
+(define-public (accept-buddy-request (request-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? buddy-requests { request-id: request-id }) ERR_BUDDY_REQUEST_NOT_FOUND))
+      (requester (get requester request))
+      (target (get target request))
+    )
+    ;; Validate the request
+    (asserts! (is-eq tx-sender target) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status request) "pending") ERR_ALREADY_COMPLETED)
+    
+    ;; Update request status
+    (map-set buddy-requests
+      { request-id: request-id }
+      (merge request { 
+        status: "accepted",
+        responded-at: (some stacks-block-height)
+      })
+    )
+    
+    ;; Create partnership (both directions for easy lookup)
+    (map-set buddy-partnerships
+      { user-a: requester, user-b: target }
+      {
+        started-at: stacks-block-height,
+        total-checkins: u0,
+        last-checkin: u0,
+        shared-goals: u0,
+        partnership-score: u0,
+        is-active: true
+      }
+    )
+    
+    ;; Update user partnership status
+    (map-set user-partnerships
+      { user: requester }
+      (merge (default-to 
+        { has-buddy: false, current-buddy: none, is-mentor: false, has-mentor: false, current-mentor: none, total-partnerships: u0, successful-partnerships: u0 }
+        (map-get? user-partnerships { user: requester })
+      ) { 
+        has-buddy: true,
+        current-buddy: (some target),
+        total-partnerships: (+ (default-to u0 (get total-partnerships (map-get? user-partnerships { user: requester }))) u1)
+      })
+    )
+    
+    (map-set user-partnerships
+      { user: target }
+      (merge (default-to 
+        { has-buddy: false, current-buddy: none, is-mentor: false, has-mentor: false, current-mentor: none, total-partnerships: u0, successful-partnerships: u0 }
+        (map-get? user-partnerships { user: target })
+      ) { 
+        has-buddy: true,
+        current-buddy: (some requester),
+        total-partnerships: (+ (default-to u0 (get total-partnerships (map-get? user-partnerships { user: target }))) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Register as a mentor
+(define-public (register-as-mentor (specialties (string-ascii 100)) (max-mentees uint))
+  (let
+    (
+      (current-stats (map-get? user-stats { user: tx-sender }))
+    )
+    ;; Must have some experience to be a mentor
+    (asserts! (is-some current-stats) ERR_GOAL_NOT_FOUND)
+    (asserts! (>= (get completed-goals (unwrap! current-stats ERR_GOAL_NOT_FOUND)) u3) ERR_REQUIREMENTS_NOT_MET)
+    (asserts! (> max-mentees u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= max-mentees u10) ERR_INVALID_AMOUNT) ;; Max 10 mentees
+    
+    (map-set mentors
+      { mentor: tx-sender }
+      {
+        registered-at: stacks-block-height,
+        specialties: specialties,
+        max-mentees: max-mentees,
+        current-mentees: u0,
+        total-mentees-helped: u0,
+        average-rating: u0,
+        total-ratings: u0,
+        mentor-level: u1,
+        is-active: true
+      }
+    )
+    
+    ;; Update user partnership status
+    (map-set user-partnerships
+      { user: tx-sender }
+      (merge (default-to 
+        { has-buddy: false, current-buddy: none, is-mentor: false, has-mentor: false, current-mentor: none, total-partnerships: u0, successful-partnerships: u0 }
+        (map-get? user-partnerships { user: tx-sender })
+      ) { is-mentor: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Request mentorship
+(define-public (request-mentorship (mentor principal) (message (string-ascii 200)))
+  (let
+    (
+      (mentor-info (unwrap! (map-get? mentors { mentor: mentor }) ERR_NOT_A_MENTOR))
+      (mentee-status (default-to 
+        { has-buddy: false, current-buddy: none, is-mentor: false, has-mentor: false, current-mentor: none, total-partnerships: u0, successful-partnerships: u0 }
+        (map-get? user-partnerships { user: tx-sender })
+      ))
+    )
+    ;; Validation
+    (asserts! (not (is-eq tx-sender mentor)) ERR_CANNOT_BUDDY_YOURSELF)
+    (asserts! (get is-active mentor-info) ERR_NOT_A_MENTOR)
+    (asserts! (< (get current-mentees mentor-info) (get max-mentees mentor-info)) ERR_MENTOR_CAPACITY_FULL)
+    (asserts! (not (get has-mentor mentee-status)) ERR_ALREADY_HAVE_BUDDY)
+    
+    ;; Create mentorship
+    (map-set mentorships
+      { mentor: mentor, mentee: tx-sender }
+      {
+        started-at: stacks-block-height,
+        goals-completed-together: u0,
+        last-interaction: stacks-block-height,
+        mentee-progress-score: u0,
+        mentor-rating: none,
+        is-active: true,
+        graduation-date: none
+      }
+    )
+    
+    ;; Update mentor's mentee count
+    (map-set mentors
+      { mentor: mentor }
+      (merge mentor-info { 
+        current-mentees: (+ (get current-mentees mentor-info) u1),
+        total-mentees-helped: (+ (get total-mentees-helped mentor-info) u1)
+      })
+    )
+    
+    ;; Update mentee status
+    (map-set user-partnerships
+      { user: tx-sender }
+      (merge mentee-status { 
+        has-mentor: true,
+        current-mentor: (some mentor)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Buddy/Mentor check-in
+(define-public (partner-checkin (partner principal) (checkin-type (string-ascii 20)) (message (string-ascii 300)) (progress-update uint))
+  (let
+    (
+      (checkin-date (/ stacks-block-height u144)) ;; Daily check-ins
+      (partnership-key-1 { user-a: tx-sender, user-b: partner })
+      (partnership-key-2 { user-a: partner, user-b: tx-sender })
+      (partnership-1 (map-get? buddy-partnerships partnership-key-1))
+      (partnership-2 (map-get? buddy-partnerships partnership-key-2))
+      (partnership (if (is-some partnership-1) partnership-1 partnership-2))
+      (mentorship-as-mentor (map-get? mentorships { mentor: tx-sender, mentee: partner }))
+      (mentorship-as-mentee (map-get? mentorships { mentor: partner, mentee: tx-sender }))
+    )
+    ;; Must have active partnership or mentorship
+    (asserts! (or (is-some partnership) (is-some mentorship-as-mentor) (is-some mentorship-as-mentee)) ERR_NO_ACTIVE_PARTNERSHIP)
+    
+    ;; Record check-in
+    (map-set checkins
+      { user: tx-sender, partner: partner, date: checkin-date }
+      {
+        checkin-type: checkin-type,
+        message: message,
+        progress-update: progress-update,
+        encouragement-given: true,
+        created-at: stacks-block-height
+      }
+    )
+    
+    ;; Update partnership/mentorship stats
+    (if (is-some partnership)
+      (begin
+        (map-set buddy-partnerships
+          (if (is-some (map-get? buddy-partnerships partnership-key-1)) partnership-key-1 partnership-key-2)
+          (merge (unwrap-panic partnership) { 
+            total-checkins: (+ (get total-checkins (unwrap-panic partnership)) u1),
+            last-checkin: stacks-block-height,
+            partnership-score: (+ (get partnership-score (unwrap-panic partnership)) progress-update)
+          })
+        )
+        ;; Reward both buddies
+        (unwrap! (ft-mint? fitchain-token (var-get checkin-reward) tx-sender) ERR_INSUFFICIENT_BALANCE)
+        (unwrap! (ft-mint? fitchain-token (var-get checkin-reward) partner) ERR_INSUFFICIENT_BALANCE)
+      )
+      ;; Handle mentorship check-in
+      (if (is-some mentorship-as-mentor)
+        ;; Mentor checking in on mentee - give mentor bonus
+        (unwrap! (ft-mint? fitchain-token (/ (* (var-get checkin-reward) (var-get mentor-bonus-multiplier)) u100) tx-sender) ERR_INSUFFICIENT_BALANCE)
+        ;; Mentee checking in with mentor
+        (unwrap! (ft-mint? fitchain-token (var-get checkin-reward) tx-sender) ERR_INSUFFICIENT_BALANCE)
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Rate mentor (only for mentees)
+(define-public (rate-mentor (mentor principal) (rating uint))
+  (let
+    (
+      (mentorship (unwrap! (map-get? mentorships { mentor: mentor, mentee: tx-sender }) ERR_NO_ACTIVE_PARTNERSHIP))
+      (mentor-info (unwrap! (map-get? mentors { mentor: mentor }) ERR_NOT_A_MENTOR))
+    )
+    (asserts! (<= rating u5) ERR_INVALID_RATING)
+    (asserts! (>= rating u1) ERR_INVALID_RATING)
+    (asserts! (get is-active mentorship) ERR_NO_ACTIVE_PARTNERSHIP)
+    (asserts! (is-none (get mentor-rating mentorship)) ERR_ALREADY_COMPLETED)
+    
+    ;; Update mentorship with rating
+    (map-set mentorships
+      { mentor: mentor, mentee: tx-sender }
+      (merge mentorship { mentor-rating: (some rating) })
+    )
+    
+    ;; Update mentor's average rating
+    (let
+      (
+        (new-total-ratings (+ (get total-ratings mentor-info) u1))
+        (new-average (/ (+ (* (get average-rating mentor-info) (get total-ratings mentor-info)) rating) new-total-ratings))
+      )
+      (map-set mentors
+        { mentor: mentor }
+        (merge mentor-info { 
+          average-rating: new-average,
+          total-ratings: new-total-ratings
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions for Buddy & Mentor System
+
+(define-read-only (get-buddy-request (request-id uint))
+  (map-get? buddy-requests { request-id: request-id })
+)
+
+(define-read-only (get-buddy-partnership (user-a principal) (user-b principal))
+  (let
+    (
+      (partnership-1 (map-get? buddy-partnerships { user-a: user-a, user-b: user-b }))
+      (partnership-2 (map-get? buddy-partnerships { user-a: user-b, user-b: user-a }))
+    )
+    (if (is-some partnership-1) partnership-1 partnership-2)
+  )
+)
+
+(define-read-only (get-mentor-info (mentor principal))
+  (map-get? mentors { mentor: mentor })
+)
+
+(define-read-only (get-mentorship (mentor principal) (mentee principal))
+  (map-get? mentorships { mentor: mentor, mentee: mentee })
+)
+
+(define-read-only (get-user-partnerships (user principal))
+  (map-get? user-partnerships { user: user })
+)
+
+(define-read-only (get-checkin (user principal) (partner principal) (date uint))
+  (map-get? checkins { user: user, partner: partner, date: date })
+)
+
+(define-read-only (get-buddy-system-stats)
+  {
+    total-buddy-requests: (var-get buddy-request-id-nonce),
+    checkin-reward: (var-get checkin-reward),
+    mentor-bonus-multiplier: (var-get mentor-bonus-multiplier),
+    partnership-success-bonus: (var-get partnership-success-bonus)
+  }
+)
+
